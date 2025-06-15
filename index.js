@@ -1,55 +1,53 @@
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
-const mysql = require('mysql2/promise');
+const mongoose = require('mongoose');
 const bcrypt = require('bcrypt');
 const url = require('url');
-require('dotenv').config(); // Load .env variables locally
 
-// Database config using environment variables
-const dbConfig = {
-  host: process.env.DB_HOST || 'localhost',
-  user: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'gym_data',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0,
-};
+// Environment configuration
+const PORT = process.env.PORT || 8000;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://localhost:27017/gym_data';
+const NODE_ENV = process.env.NODE_ENV || 'development';
 
-const pool = mysql.createPool(dbConfig);
-
-// Test DB connection
-async function testConnection() {
+// Connect to MongoDB
+async function connectDB() {
   try {
-    const connection = await pool.getConnection();
-    console.log('✅ Connected to MySQL Database');
-    connection.release();
+    await mongoose.connect(MONGODB_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+    });
+    console.log('✅ Connected to MongoDB Database');
   } catch (err) {
-    console.error('❌ MySQL connection failed:', err.message);
+    console.error('❌ MongoDB connection failed:', err.message);
     process.exit(1);
   }
 }
 
-// Initialize DB schema
-async function initDatabase() {
-  try {
-    await pool.execute(`
-      CREATE TABLE IF NOT EXISTS user (
-        id INT AUTO_INCREMENT PRIMARY KEY,
-        name VARCHAR(100) NOT NULL UNIQUE,
-        password VARCHAR(255) NOT NULL,
-        email VARCHAR(100),
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-      )
-    `);
-    console.log('✅ Database tables initialized');
-  } catch (err) {
-    console.error('❌ Database initialization failed:', err.message);
+// User Schema
+const userSchema = new mongoose.Schema({
+  name: {
+    type: String,
+    required: true,
+    unique: true,
+    maxlength: 100
+  },
+  password: {
+    type: String,
+    required: true,
+    maxlength: 255
+  },
+  email: {
+    type: String,
+    maxlength: 100,
+    default: null
   }
-}
+}, {
+  timestamps: true // This adds createdAt and updatedAt fields automatically
+});
 
-// JSON body parser
+// Create User model
+const User = mongoose.model('User', userSchema);
+
+// Parse JSON body
 const parseBody = (req) =>
   new Promise((resolve, reject) => {
     let body = '';
@@ -64,7 +62,7 @@ const parseBody = (req) =>
     req.on('error', reject);
   });
 
-// Send HTTP response
+// Send response
 const sendResponse = (res, statusCode, data, contentType = 'application/json') => {
   res.writeHead(statusCode, {
     'Content-Type': contentType,
@@ -80,7 +78,7 @@ const sendResponse = (res, statusCode, data, contentType = 'application/json') =
   }
 };
 
-// Routes
+// API routes
 const routes = {
   'OPTIONS *': (req, res) => sendResponse(res, 200, '', 'text/plain'),
 
@@ -96,21 +94,36 @@ const routes = {
         return sendResponse(res, 400, { success: false, error: 'Password must be at least 6 characters' });
       }
 
-      const [existing] = await pool.execute('SELECT id FROM user WHERE name = ?', [name]);
-      if (existing.length > 0) {
+      // Check if user already exists
+      const existingUser = await User.findOne({ name });
+      if (existingUser) {
         return sendResponse(res, 409, { success: false, error: 'Username already exists' });
       }
 
       const hashedPassword = await bcrypt.hash(password, 12);
-      const [result] = await pool.execute(
-        'INSERT INTO user (name, password, email) VALUES (?, ?, ?)',
-        [name, hashedPassword, email || null]
-      );
+      
+      // Create new user
+      const newUser = new User({
+        name,
+        password: hashedPassword,
+        email: email || null
+      });
 
-      sendResponse(res, 201, { success: true, message: 'Account created', userId: result.insertId });
+      const savedUser = await newUser.save();
+
+      sendResponse(res, 201, { 
+        success: true, 
+        message: 'Account created', 
+        userId: savedUser._id 
+      });
     } catch (err) {
       console.error('Register error:', err);
-      sendResponse(res, 500, { success: false, error: 'Internal server error' });
+      if (err.code === 11000) {
+        // Duplicate key error
+        sendResponse(res, 409, { success: false, error: 'Username already exists' });
+      } else {
+        sendResponse(res, 500, { success: false, error: 'Internal server error' });
+      }
     }
   },
 
@@ -122,19 +135,23 @@ const routes = {
         return sendResponse(res, 400, { success: false, error: 'Name and password required' });
       }
 
-      const [users] = await pool.execute('SELECT id, password FROM user WHERE name = ?', [name]);
-      if (users.length === 0) {
+      // Find user by name
+      const user = await User.findOne({ name });
+      if (!user) {
         return sendResponse(res, 401, { success: false, error: 'Invalid credentials' });
       }
 
-      const user = users[0];
       const match = await bcrypt.compare(password, user.password);
 
       if (!match) {
         return sendResponse(res, 401, { success: false, error: 'Invalid credentials' });
       }
 
-      sendResponse(res, 200, { success: true, message: 'Login successful', userId: user.id });
+      sendResponse(res, 200, { 
+        success: true, 
+        message: 'Login successful', 
+        userId: user._id 
+      });
     } catch (err) {
       console.error('Login error:', err);
       sendResponse(res, 500, { success: false, error: 'Internal server error' });
@@ -143,7 +160,14 @@ const routes = {
 
   'GET /users': async (req, res) => {
     try {
-      const [users] = await pool.execute('SELECT id, name, email, created_at FROM user');
+      // Select only specific fields, exclude password
+      const users = await User.find({}, { 
+        name: 1, 
+        email: 1, 
+        createdAt: 1, 
+        _id: 1 
+      });
+      
       sendResponse(res, 200, { success: true, users });
     } catch (err) {
       console.error('Fetch users error:', err);
@@ -156,9 +180,14 @@ const routes = {
       const { id } = await parseBody(req);
       if (!id) return sendResponse(res, 400, { success: false, error: 'User ID required' });
 
-      const [result] = await pool.execute('DELETE FROM user WHERE id = ?', [id]);
+      // Validate MongoDB ObjectId
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        return sendResponse(res, 400, { success: false, error: 'Invalid user ID format' });
+      }
 
-      if (result.affectedRows === 0) {
+      const deletedUser = await User.findByIdAndDelete(id);
+
+      if (!deletedUser) {
         return sendResponse(res, 404, { success: false, error: 'User not found' });
       }
 
@@ -174,9 +203,18 @@ const routes = {
       const { id, email } = await parseBody(req);
       if (!id || !email) return sendResponse(res, 400, { success: false, error: 'ID and new email required' });
 
-      const [result] = await pool.execute('UPDATE user SET email = ? WHERE id = ?', [email, id]);
+      // Validate MongoDB ObjectId
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        return sendResponse(res, 400, { success: false, error: 'Invalid user ID format' });
+      }
 
-      if (result.affectedRows === 0) {
+      const updatedUser = await User.findByIdAndUpdate(
+        id, 
+        { email }, 
+        { new: true, runValidators: true }
+      );
+
+      if (!updatedUser) {
         return sendResponse(res, 404, { success: false, error: 'User not found' });
       }
 
@@ -192,30 +230,58 @@ const routes = {
       <html>
         <head><title>Body Garage</title></head>
         <body>
-          <h1>🏋️ Welcome to Body Garage Server</h1>
+          <h1>🏋 Welcome to Body Garage Server</h1>
+          <p>Environment: ${NODE_ENV}</p>
+          <p>Server running on port: ${PORT}</p>
           <p>Use Postman or frontend to access API routes.</p>
         </body>
       </html>
     `;
     sendResponse(res, 200, html, 'text/html');
   },
+
+  'GET /health': (req, res) => {
+    sendResponse(res, 200, { 
+      success: true, 
+      status: 'healthy',
+      timestamp: new Date().toISOString(),
+      environment: NODE_ENV,
+      port: PORT
+    });
+  }
 };
 
-// Create server and route requests
-const server = http.createServer((req, res) => {
-  const parsedUrl = url.parse(req.url, true);
-  const method = req.method;
-  const routeKey = `${method} ${parsedUrl.pathname}`;
-  const handler = routes[routeKey] || routes[`${method} *`] || routes['GET /'];
-  handler(req, res);
+// Server setup
+const server = http.createServer(async (req, res) => {
+  if (req.method === 'OPTIONS') {
+    routes['OPTIONS *'](req, res);
+    return;
+  }
+
+  const routeKey = `${req.method} ${url.parse(req.url).pathname}`;
+  if (routes[routeKey]) {
+    await routes[routeKey](req, res);
+  } else {
+    sendResponse(res, 404, { error: 'Not found' });
+  }
+});
+
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n🛑 Shutting down gracefully...');
+  await mongoose.connection.close();
+  server.close(() => {
+    console.log('✅ Server closed');
+    process.exit(0);
+  });
 });
 
 // Start server
-const PORT = process.env.PORT || 8000;
 (async () => {
-  await testConnection();
-  await initDatabase();
-  server.listen(PORT, () => {
+  await connectDB();
+  server.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 Server running on port ${PORT}`);
+    console.log(`📊 Environment: ${NODE_ENV}`);
+    console.log(`🗄️  Database: ${MONGODB_URI.includes('localhost') ? 'Local MongoDB' : 'Remote MongoDB'}`);
   });
 })();
